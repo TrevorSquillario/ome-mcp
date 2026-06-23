@@ -1,0 +1,36 @@
+[Unit]
+Description=OME MCP v5 – Dell OpenManage Enterprise MCP Server
+Documentation=https://github.com/your-org/ome_mcp_v5
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+
+# Run as the user who owns the project directory (change if needed)
+User=root
+
+# Project directory – update this path
+WorkingDirectory=/opt/ome_mcp_v5
+
+# Load credentials from .env file
+EnvironmentFile=/opt/ome_mcp_v5/.env
+
+ExecStartPre=/usr/bin/docker compose pull --quiet
+ExecStart=/usr/bin/docker compose up --remove-orphans
+ExecStop=/usr/bin/docker compose down
+ExecReload=/usr/bin/docker compose restart
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ome_mcp_v5
+
+# Resource limits
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
