@@ -1,5 +1,13 @@
 ## Changelog
 
+### v6.1.0 — 2026-06-24
+
+- **Refactor:** Extract `OMEClient` into `src/ome_client.py` and move Pydantic input models into `src/models.py` to improve separation of concerns. Fixed odata filter handling by removing unnecessary html escape characters. Improved Pydantic model descriptions to help the LLM with odata filtering fields. Added an `include` argument to `_ome_get` to limit the amount of json returned.
+- **Server:** `src/ome_mcp_server.py` updated to use the refactored client/models. 
+- **Docker:** `Dockerfile` now copies the full `src/` tree and runs `fastmcp run ome_mcp_server.py` as the container command. Added `OME_APP_ENV` to control if the hot reload flag `--reload` is added to the fastmcp startup command. 
+- **Compose:** `compose.yml` updated to expose `OME_MCP_PORT` and mount `./src:/app` for live development.
+- **Repo:** Added/untracked files: `src/models.py`, `src/ome_client.py`.
+
 ### v6.0.0 — 2026-06-23
 
 **Major restructuring: monolithic server → package layout, v5 naming dropped**

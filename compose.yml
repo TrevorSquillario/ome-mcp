@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        OME_APP_ENV: "${OME_APP_ENV:-dev}"
     container_name: ome_mcp
     restart: unless-stopped
     ports:
@@ -18,9 +20,10 @@ services:
       OME_PASSWORD: "${OME_PASSWORD}"
       # ── TLS Toggle (set to "true" in production) ─────────────────────────
       OME_VERIFY_SSL: "${OME_VERIFY_SSL:-false}"
-      # ── MCP Listen ───────────────────────────────────────────────────────
-      OME_MCP_HOST: "${OME_MCP_HOST:-0.0.0.0}"
-      OME_MCP_PORT: "${OME_MCP_PORT:-8000}"
+      # runtime environment mode (dev|prod)
+      OME_APP_ENV: "${OME_APP_ENV:-dev}"
+    volumes:
+      - ./src:/app/src
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s

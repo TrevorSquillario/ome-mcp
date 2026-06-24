@@ -24,6 +24,8 @@ import httpx
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 from utils.logging_config import configure_logging
+from models import *
+from ome_client import OMEClient
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -39,189 +41,89 @@ OME_MCP_PORT     = int(os.environ.get("OME_MCP_PORT", "8000"))
 
 BASE_URL = f"https://{OME_IP}:{OME_PORT}/api"
 
-# ── Session State (per-server lifecycle) ─────────────────────────────────────
-_session_token: Optional[str] = None
-_session_id: Optional[str] = None
-_session_lock = asyncio.Lock()
+# Alert / status mapping dictionaries 
+SEVERITY_TYPE_MAP = {
+    "WARNING": "8",
+    "CRITICAL": "16",
+    "INFO": "2",
+    "NORMAL": "4",
+    "UNKNOWN": "1",
+}
+
+STATUS_TYPE_MAP = {
+    "NORMAL": "1000",
+    "UNKNOWN": "2000",
+    "WARNING": "3000",
+    "CRITICAL": "4000",
+    "NOSTATUS": "5000",
+}
+
+ALERT_DEVICE_TYPE_MAP = {
+    "SERVER": "1000",
+    "CHASSIS": "2000",
+    "NETWORK_CONTROLLER": "9000",
+    "NETWORK_IOM": "4000",
+    "STORAGE": "3000",
+    "STORAGE_IOM": "8000",
+}
+
+CATEGORY_ID_MAP = {
+    "AUDIT": 4,
+    "MISCELLANEOUS": 7,
+    "STORAGE": 2,
+    "SYSTEM_HEALTH": 1,
+    "UPDATES": 3,
+    "WORK_NOTES": 6,
+    "CONFIGURATION": 5,
+}
+
+# Create a shared OMEClient instance and expose thin wrappers so the
+# rest of this module (many `ome_*` tool functions) can continue to call
+# the familiar helper names without further changes.
+_ome_client = OMEClient()
 
 
-# ── OME HTTP Client (shared, connection-pooled) ──────────────────────────────
-_client: Optional[httpx.AsyncClient] = None
+_session_lock = _ome_client._session_lock
 
 
 def _get_client() -> httpx.AsyncClient:
-    """Return the shared HTTP client, creating it on first use."""
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(
-            verify=OME_VERIFY_SSL,
-            timeout=httpx.Timeout(60.0, connect=10.0),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-        )
-    return _client
+    return _ome_client.get_client()
 
 
 async def _close_client() -> None:
-    """Close the shared HTTP client."""
-    global _client
-    if _client:
-        await _client.aclose()
-        _client = None
+    await _ome_client.close()
 
 
 async def _get_token() -> str:
-    """Return a valid session token, creating one if needed."""
-    global _session_token, _session_id
-    async with _session_lock:
-        if _session_token:
-            logger.debug("Reusing cached OME session token (id=%s)", _session_id)
-            return _session_token
-        if not OME_USER or not OME_PASSWORD:
-            logger.error(
-                "OME_USER and OME_PASSWORD environment variables must be set."
-            )
-            raise RuntimeError(
-                "OME_USER and OME_PASSWORD environment variables must be set."
-            )
-        logger.info(
-            "Authenticating to OME at %s as user '%s'",
-            BASE_URL,
-            OME_USER,
-        )
-        payload = {"UserName": OME_USER, "Password": OME_PASSWORD, "SessionType": "API"}
-        client = _get_client()
-        r = await client.post(f"{BASE_URL}/SessionService/Sessions", json=payload)
-        r.raise_for_status()
-        _session_token = r.headers.get("X-Auth-Token", "")
-        _session_id = r.json().get("Id", "")
-        logger.info(
-            "OME session established (id=%s, token_prefix=%s...)",
-            _session_id,
-            _session_token[:8] if _session_token else "none",
-        )
-        return _session_token
+    return await _ome_client.get_token()
 
 
 async def _logout() -> None:
-    """Invalidate the current OME session."""
-    global _session_token, _session_id
-    if not _session_token or not _session_id:
-        logger.debug("Logout skipped — no active session to close")
-        return
-    logger.info(
-        "Logging out of OME session (id=%s, token_prefix=%s...)",
-        _session_id,
-        _session_token[:8] if _session_token else "none",
-    )
-    try:
-        client = _get_client()
-        headers = {"X-Auth-Token": _session_token}
-        await client.delete(
-            f"{BASE_URL}/SessionService/Sessions/{_session_id}", headers=headers
-        )
-        logger.info("OME session %s closed successfully", _session_id)
-    except httpx.HTTPStatusError as exc:
-        logger.warning(
-            "Logout HTTP error for session %s: %s %s",
-            _session_id,
-            exc.response.status_code,
-            exc.response.text[:200],
-        )
-    except Exception as exc:
-        logger.warning("Logout error for session %s: %s", _session_id, exc)
-    finally:
-        logger.debug("Clearing cached OME session token and id")
-        _session_token = None
-        _session_id = None
+    await _ome_client.logout()
 
 
 async def _invalidate_token() -> None:
-    """Clear the cached session token so the next call re-authenticates."""
-    global _session_token, _session_id
-    async with _session_lock:
-        old_id = _session_id
-        old_prefix = _session_token[:8] if _session_token else "none"
-        logger.info(
-            "Invalidating expired OME session token (id=%s, token_prefix=%s...)",
-            old_id,
-            old_prefix,
-        )
-        _session_token = None
-        _session_id = None
-        logger.debug("Session token cleared (was id=%s)", old_id)
+    await _ome_client.invalidate_token()
 
 
-async def _ome_get(path: str, params: dict = None) -> Any:
-    """GET from OME API, returns parsed JSON. Auto-retries once on 401."""
-    for attempt in range(2):
-        token = await _get_token()
-        client = _get_client()
-        r = await client.get(
-            f"{BASE_URL}/{path.lstrip('/')}",
-            headers={"X-Auth-Token": token},
-            params=params or {},
-        )
-        if r.status_code == 401 and attempt == 0:
-            await _invalidate_token()
-            continue
-        _raise_for_status(r)
-        return r.json()
+def _build_query_string(params: Optional[dict]) -> str:
+    return _ome_client.build_query_string(params)
+
+
+async def _ome_get(path: str, params: dict = None, include: Optional[List[str]] = None) -> Any:
+    return await _ome_client.ome_get(path, params=params, include=include)
 
 
 async def _ome_post(path: str, payload: dict) -> Any:
-    """POST to OME API, returns parsed JSON. Auto-retries once on 401."""
-    for attempt in range(2):
-        token = await _get_token()
-        client = _get_client()
-        r = await client.post(
-            f"{BASE_URL}/{path.lstrip('/')}",
-            headers={"X-Auth-Token": token},
-            json=payload,
-        )
-        if r.status_code == 401 and attempt == 0:
-            await _invalidate_token()
-            continue
-        _raise_for_status(r)
-        try:
-            return r.json()
-        except Exception:
-            return {"status": r.status_code, "text": r.text}
+    return await _ome_client.ome_post(path, payload)
 
 
 async def _ome_delete(path: str) -> Any:
-    """DELETE on OME API. Auto-retries once on 401."""
-    for attempt in range(2):
-        token = await _get_token()
-        client = _get_client()
-        r = await client.delete(
-            f"{BASE_URL}/{path.lstrip('/')}",
-            headers={"X-Auth-Token": token},
-        )
-        if r.status_code == 401 and attempt == 0:
-            await _invalidate_token()
-            continue
-        _raise_for_status(r)
-        return {"status": r.status_code}
+    return await _ome_client.ome_delete(path)
 
 
 def _raise_for_status(r: httpx.Response) -> None:
-    """Raise with a meaningful message on HTTP errors, including OME ExtendedInfo."""
-    if r.status_code >= 400:
-        try:
-            body = r.json()
-            err = body.get("error", {})
-            parts = [err.get("message", "")]
-            # OME puts the real detail in error.@Message.ExtendedInfo[].Message
-            for info in err.get("@Message.ExtendedInfo", []):
-                detail = info.get("Message", "")
-                if detail and detail not in parts:
-                    parts.append(detail)
-            msg = " | ".join(p for p in parts if p) or r.text
-        except Exception:
-            msg = r.text
-        raise httpx.HTTPStatusError(
-            f"OME API error {r.status_code}: {msg}", request=r.request, response=r
-        )
+    return _ome_client.raise_for_status(r)
 
 
 def _ok(data: Any) -> str:
@@ -236,95 +138,6 @@ def _err(msg: str) -> str:
 def _handle(exc: Exception) -> str:
     logger.error("Tool error: %s", exc, exc_info=True)
     return _err(exc)
-
-
-# ── Pydantic Input Models ─────────────────────────────────────────────────────
-
-class PaginationInput(BaseModel):
-    """Common pagination parameters."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    top: int = Field(default=50, description="Max records to return", ge=1, le=1000)
-    skip: int = Field(default=0, description="Records to skip (for pagination)", ge=0)
-    filter: str = Field(default="", description="OData $filter expression, e.g. \"Model eq 'PowerEdge R640'\"")
-
-
-class DeviceIdInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    device_id: int = Field(..., description="OME numeric device ID", ge=1)
-
-
-class GroupIdInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    group_id: int = Field(..., description="OME numeric group ID", ge=1)
-
-
-class AlertsInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    top: int = Field(default=50, ge=1, le=1000, description="Max alerts to return")
-    skip: int = Field(default=0, ge=0, description="Records to skip")
-    filter: str = Field(default="", description="OData filter, e.g. \"Severity eq 'Critical'\"")
-
-
-class JobIdInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    job_id: int = Field(..., description="OME numeric job ID", ge=1)
-
-
-class PowerActionInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    device_ids: List[int] = Field(..., description="List of OME device IDs to act on", min_length=1)
-    action: str = Field(..., description="Power action: PowerOn, PowerOff, GracefulShutdown, GracefulRestart, MasterBusReset, PowerCycle")
-
-    @field_validator("action")
-    @classmethod
-    def validate_action(cls, v: str) -> str:
-        allowed = {"PowerOn", "PowerOff", "GracefulShutdown", "GracefulRestart", "MasterBusReset", "PowerCycle"}
-        if v not in allowed:
-            raise ValueError(f"action must be one of: {', '.join(sorted(allowed))}")
-        return v
-
-
-class DiscoveryInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    name: str = Field(..., description="Name for this discovery job", min_length=1, max_length=100)
-    ip_range: str = Field(..., description="IP range to discover, e.g. '192.168.1.100-192.168.1.200'", min_length=1)
-    protocol: str = Field(default="HTTPS", description="Discovery protocol: HTTPS, REDFISH, or WSMAN")
-    username: str = Field(default="", description="iDRAC username (leave empty to use OME default)")
-    password: str = Field(default="", description="iDRAC password (leave empty to use OME default)")
-
-    @field_validator("protocol")
-    @classmethod
-    def validate_protocol(cls, v: str) -> str:
-        allowed = {"HTTPS", "REDFISH", "WSMAN"}
-        if v.upper() not in allowed:
-            raise ValueError(f"protocol must be one of: {', '.join(sorted(allowed))}")
-        return v.upper()
-
-
-class TemplateIdInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    template_id: int = Field(..., description="OME template ID", ge=1)
-
-
-class BaselineIdInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    baseline_id: int = Field(..., description="OME baseline ID", ge=1)
-
-
-class AlertAckInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    alert_ids: List[int] = Field(..., description="List of alert IDs to acknowledge", min_length=1)
-
-
-class RunJobInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    job_id: int = Field(..., description="OME job ID to run immediately", ge=1)
-
-
-class FirmwareBaselineInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    baseline_id: int = Field(..., description="Firmware baseline ID", ge=1)
-
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
@@ -357,28 +170,37 @@ mcp = FastMCP("OME (OpenManage Enterprise) MCP Server", lifespan=lifespan)
     name="ome_list_devices",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
 )
-async def ome_list_devices(params: PaginationInput) -> str:
-    """List all managed devices in OME with optional OData filtering and pagination.
+async def ome_list_devices(params: DeviceInput) -> str:
+    """List all managed infrastructure devices in OpenManage Enterprise (OME).
 
-    Returns device ID, name, model, service tag, power state, and health status.
+    Use this tool when a user wants to inventory hardware, find specific machine details, 
+    check server models, find a device by service tag, or check system health/power states.
+
+    This tool returns detailed attributes for each device including:
+    Id, Type, DeviceName, Model, DeviceServiceTag, PowerState, ManagedState, Health, 
+    DeviceManagement, LastInventoryTime, and LastStatusTime.
 
     Args:
-        params (PaginationInput): top (max records), skip (offset), filter (OData expression)
+        params: The pagination constraints and explicit OData filter parameters.
 
     Returns:
-        str: JSON object with 'count', 'value' (list of devices), and 'next_skip'.
+        str: A JSON payload containing:
+            - 'count' (int): Total records matching the criteria.
+            - 'value' (list): Array of device metadata objects.
+            - 'next_skip' (int): The calculated offset marker for the next page.
     """
     try:
+        include_fields = ["Id", "Type", "DeviceName", "Model", "DeviceServiceTag", "PowerState", "ManagedState", "Health", "DeviceManagement", "LastInventoryTime", "LastStatusTime"]
         qs: dict = {"$top": params.top, "$skip": params.skip}
         if params.filter.strip():
             qs["$filter"] = params.filter
-        data = await _ome_get("DeviceService/Devices", qs)
+        data = await _ome_get("DeviceService/Devices", qs, include=include_fields)
         result = {
             "count": data.get("@odata.count", len(data.get("value", []))),
             "value": data.get("value", []),
-            "next_skip": params.skip + params.top,
+            "next_skip": params.skip + params.top, 
         }
-        return _ok(result)
+        return _ok(result) 
     except Exception as exc:
         return _handle(exc)
 
@@ -530,14 +352,17 @@ async def ome_list_groups(params: PaginationInput) -> str:
     Args:
         params (PaginationInput): top, skip, filter (OData)
 
+    Filters Available: ("Name", "TypeId", "Id")
+
     Returns:
         str: JSON object with count and value (list of groups).
     """
     try:
+        include_fields = ["Id", "ParentId", "TypeId", "Name", "CreationTime", "UpdatedTime", "CreatedBy", "UpdatedBy"]
         qs = {"$top": params.top, "$skip": params.skip}
         if params.filter.strip():
             qs["$filter"] = params.filter
-        data = await _ome_get("GroupService/Groups", qs)
+        data = await _ome_get("GroupService/Groups", qs, include=include_fields)
         return _ok({"count": data.get("@odata.count", 0), "value": data.get("value", [])})
     except Exception as exc:
         return _handle(exc)
@@ -557,7 +382,8 @@ async def ome_get_group_devices(params: GroupIdInput) -> str:
         str: JSON object with device list for the group.
     """
     try:
-        data = await _ome_get(f"GroupService/Groups({params.group_id})/Devices")
+        include_fields = ["Id", "Type", "DeviceName", "Model", "DeviceServiceTag"]
+        data = await _ome_get(f"GroupService/Groups({params.group_id})/Devices", include=include_fields)
         return _ok({"count": data.get("@odata.count", 0), "value": data.get("value", [])})
     except Exception as exc:
         return _handle(exc)
@@ -567,20 +393,29 @@ async def ome_get_group_devices(params: GroupIdInput) -> str:
 # ALERT TOOLS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+
 @mcp.tool(
     name="ome_list_alerts",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
 )
 async def ome_list_alerts(params: AlertsInput) -> str:
-    """List OME alerts with optional severity/status filter and pagination.
+    """List OpenManage Enterprise (OME) alerts with optional pagination and filters.
 
-    Filter examples: \"Severity eq 'Critical'\", \"StatusType eq 'New'\".
+    Use this tool when users want to view, check, list, or filter system logs and hardware alerts.
+    You must construct a valid OData string in the `filter` argument using the value maps below.
+
+    Valid Mappings (Convert user text to these integer/string IDs in the filter string):
+    - SeverityType: WARNING='8', CRITICAL='16', INFO='2', NORMAL='4', UNKNOWN='1'
+    - StatusType: NORMAL='1000', UNKNOWN='2000', WARNING='3000', CRITICAL='4000', NOSTATUS='5000'
+    - AlertDeviceType: SERVER='1000', CHASSIS='2000', NETWORK_CONTROLLER='9000', NETWORK_IOM='4000', STORAGE='3000', STORAGE_IOM='8000'
+    - CategoryName: AUDIT=4, MISCELLANEOUS=7, STORAGE=2, SYSTEM_HEALTH=1, UPDATES=3, WORK_NOTES=6, CONFIGURATION=5
 
     Args:
-        params (AlertsInput): top, skip, filter (OData)
+        params: The pagination and OData filter parameters object.
 
     Returns:
-        str: JSON object with count and list of alert records.
+        str: A JSON string containing the count and a list of matching alert records.
     """
     try:
         qs: dict = {"$top": params.top, "$skip": params.skip}
