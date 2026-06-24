@@ -27,7 +27,7 @@ management must go through OME — never connect directly to iDRAC.
 
 ### Files to generate (exactly these)
 
-1. `ome_mcp_v5_server.py` — main Python server
+1. `ome_mcp_server.py` — main Python server
 2. `Dockerfile` — Python 3.11-slim, `version="5.2.0"` label, non-root user `mcpuser` (UID 1000), exposes port 8000
 3. `requirements.txt` — `mcp[cli]>=1.6.0`, `httpx>=0.27.0`, `pydantic>=2.7.0`, `uvicorn>=0.30.0`, `starlette>=0.40.0`
 4. `docker-compose.yml` — **no `version:` field** (obsolete, causes warnings), credentials via env, log rotation

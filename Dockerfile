@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY ome_mcp_v5_server.py .
+COPY src/ .
 
 # Non-root user
 RUN useradd -m -u 1000 mcpuser && chown -R mcpuser:mcpuser /app
@@ -29,4 +29,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -sf http://localhost:${MCP_PORT:-8000}/health || exit 1
 
-CMD ["python", "ome_mcp_v5_server.py"]
+CMD ["python", "ome_mcp_server.py"]

@@ -13,64 +13,20 @@ import sys
 import json
 import logging
 import asyncio
+from typing import Any, Dict, List, Optional
+import asyncio
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict, Any
-from enum import Enum
+from fastmcp import FastMCP
+from fastmcp.utilities.types import Image
+from starlette.responses import JSONResponse
 
 import httpx
 from pydantic import BaseModel, Field, field_validator, ConfigDict
-from mcp.server.fastmcp import FastMCP, Context
 
-# ── Logging (always stderr) ──────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    stream=sys.stderr,
-)
-logger = logging.getLogger("ome_mcp_v5")
+from utils.logging_config import configure_logging
 
-
-def _patch_transport_security() -> None:
-    """Neutralize FastMCP host-header validation so external IPs are accepted.
-
-    FastMCP's transport_security module rejects Host headers that don't match
-    its allowed-hosts list.  We inspect the module at runtime and replace every
-    callable that looks like a host validator with a passthrough, making this
-    robust across SDK versions without depending on undocumented kwargs.
-    """
-    import inspect
-    try:
-        import mcp.server.transport_security as _ts
-
-        # Log the module source at DEBUG level so it shows up in logs if needed
-        try:
-            logger.debug("transport_security source:\n%s", inspect.getsource(_ts))
-        except Exception:
-            pass
-
-        # --- patch module-level callables ---
-        for attr_name in dir(_ts):
-            if attr_name.startswith("__"):
-                continue
-            obj = getattr(_ts, attr_name, None)
-            if callable(obj) and any(kw in attr_name.lower() for kw in ("host", "valid", "allow", "check")):
-                logger.info("Patching transport_security.%s", attr_name)
-                setattr(_ts, attr_name, lambda *a, **kw: True)
-
-        # --- patch class methods ---
-        TARGET_METHODS = {
-            "check_host", "_check_host", "validate_host", "_validate_host",
-            "is_valid_host", "_is_valid_host", "is_allowed", "_is_allowed",
-        }
-        for cls_name, cls in inspect.getmembers(_ts, inspect.isclass):
-            for meth_name in TARGET_METHODS:
-                if hasattr(cls, meth_name):
-                    logger.info("Patching %s.%s", cls_name, meth_name)
-                    setattr(cls, meth_name, lambda *a, **kw: True)
-
-        logger.info("transport_security patched — all hosts accepted")
-    except Exception as exc:
-        logger.warning("Could not patch transport_security (non-fatal): %s", exc)
+configure_logging()
+logger = logging.getLogger(__name__)
 
 # ── Configuration from environment ───────────────────────────────────────────
 OME_IP       = os.environ.get("OME_IP",       "192.168.1.145")
@@ -78,8 +34,8 @@ OME_USER     = os.environ.get("OME_USER",     "")
 OME_PASSWORD = os.environ.get("OME_PASSWORD", "")
 OME_PORT     = int(os.environ.get("OME_PORT", "443"))
 OME_VERIFY_SSL = os.environ.get("OME_VERIFY_SSL", "false").lower() == "true"
-MCP_HOST     = os.environ.get("MCP_HOST", "0.0.0.0")
-MCP_PORT     = int(os.environ.get("MCP_PORT", "8000"))
+OME_MCP_HOST     = os.environ.get("OME_MCP_HOST", "0.0.0.0")
+OME_MCP_PORT     = int(os.environ.get("OME_MCP_PORT", "8000"))
 
 BASE_URL = f"https://{OME_IP}:{OME_PORT}/api"
 
@@ -89,14 +45,28 @@ _session_id: Optional[str] = None
 _session_lock = asyncio.Lock()
 
 
-# ── OME HTTP Client ───────────────────────────────────────────────────────────
-def _make_client() -> httpx.AsyncClient:
-    """Return a configured async HTTP client for OME."""
-    return httpx.AsyncClient(
-        verify=OME_VERIFY_SSL,
-        timeout=httpx.Timeout(60.0, connect=10.0),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-    )
+# ── OME HTTP Client (shared, connection-pooled) ──────────────────────────────
+_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    """Return the shared HTTP client, creating it on first use."""
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            verify=OME_VERIFY_SSL,
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+    return _client
+
+
+async def _close_client() -> None:
+    """Close the shared HTTP client."""
+    global _client
+    if _client:
+        await _client.aclose()
+        _client = None
 
 
 async def _get_token() -> str:
@@ -104,18 +74,31 @@ async def _get_token() -> str:
     global _session_token, _session_id
     async with _session_lock:
         if _session_token:
+            logger.debug("Reusing cached OME session token (id=%s)", _session_id)
             return _session_token
         if not OME_USER or not OME_PASSWORD:
+            logger.error(
+                "OME_USER and OME_PASSWORD environment variables must be set."
+            )
             raise RuntimeError(
                 "OME_USER and OME_PASSWORD environment variables must be set."
             )
+        logger.info(
+            "Authenticating to OME at %s as user '%s'",
+            BASE_URL,
+            OME_USER,
+        )
         payload = {"UserName": OME_USER, "Password": OME_PASSWORD, "SessionType": "API"}
-        async with _make_client() as client:
-            r = await client.post(f"{BASE_URL}/SessionService/Sessions", json=payload)
-            r.raise_for_status()
-            _session_token = r.headers.get("X-Auth-Token", "")
-            _session_id = r.json().get("Id", "")
-            logger.info("OME session established (id=%s)", _session_id)
+        client = _get_client()
+        r = await client.post(f"{BASE_URL}/SessionService/Sessions", json=payload)
+        r.raise_for_status()
+        _session_token = r.headers.get("X-Auth-Token", "")
+        _session_id = r.json().get("Id", "")
+        logger.info(
+            "OME session established (id=%s, token_prefix=%s...)",
+            _session_id,
+            _session_token[:8] if _session_token else "none",
+        )
         return _session_token
 
 
@@ -123,17 +106,31 @@ async def _logout() -> None:
     """Invalidate the current OME session."""
     global _session_token, _session_id
     if not _session_token or not _session_id:
+        logger.debug("Logout skipped — no active session to close")
         return
+    logger.info(
+        "Logging out of OME session (id=%s, token_prefix=%s...)",
+        _session_id,
+        _session_token[:8] if _session_token else "none",
+    )
     try:
-        async with _make_client() as client:
-            headers = {"X-Auth-Token": _session_token}
-            await client.delete(
-                f"{BASE_URL}/SessionService/Sessions/{_session_id}", headers=headers
-            )
-        logger.info("OME session %s closed", _session_id)
+        client = _get_client()
+        headers = {"X-Auth-Token": _session_token}
+        await client.delete(
+            f"{BASE_URL}/SessionService/Sessions/{_session_id}", headers=headers
+        )
+        logger.info("OME session %s closed successfully", _session_id)
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "Logout HTTP error for session %s: %s %s",
+            _session_id,
+            exc.response.status_code,
+            exc.response.text[:200],
+        )
     except Exception as exc:
-        logger.warning("Logout error: %s", exc)
+        logger.warning("Logout error for session %s: %s", _session_id, exc)
     finally:
+        logger.debug("Clearing cached OME session token and id")
         _session_token = None
         _session_id = None
 
@@ -142,62 +139,69 @@ async def _invalidate_token() -> None:
     """Clear the cached session token so the next call re-authenticates."""
     global _session_token, _session_id
     async with _session_lock:
-        logger.info("Invalidating expired OME session token (id=%s)", _session_id)
+        old_id = _session_id
+        old_prefix = _session_token[:8] if _session_token else "none"
+        logger.info(
+            "Invalidating expired OME session token (id=%s, token_prefix=%s...)",
+            old_id,
+            old_prefix,
+        )
         _session_token = None
         _session_id = None
+        logger.debug("Session token cleared (was id=%s)", old_id)
 
 
 async def _ome_get(path: str, params: dict = None) -> Any:
     """GET from OME API, returns parsed JSON. Auto-retries once on 401."""
     for attempt in range(2):
         token = await _get_token()
-        async with _make_client() as client:
-            r = await client.get(
-                f"{BASE_URL}/{path.lstrip('/')}",
-                headers={"X-Auth-Token": token},
-                params=params or {},
-            )
-            if r.status_code == 401 and attempt == 0:
-                await _invalidate_token()
-                continue
-            _raise_for_status(r)
-            return r.json()
+        client = _get_client()
+        r = await client.get(
+            f"{BASE_URL}/{path.lstrip('/')}",
+            headers={"X-Auth-Token": token},
+            params=params or {},
+        )
+        if r.status_code == 401 and attempt == 0:
+            await _invalidate_token()
+            continue
+        _raise_for_status(r)
+        return r.json()
 
 
 async def _ome_post(path: str, payload: dict) -> Any:
     """POST to OME API, returns parsed JSON. Auto-retries once on 401."""
     for attempt in range(2):
         token = await _get_token()
-        async with _make_client() as client:
-            r = await client.post(
-                f"{BASE_URL}/{path.lstrip('/')}",
-                headers={"X-Auth-Token": token},
-                json=payload,
-            )
-            if r.status_code == 401 and attempt == 0:
-                await _invalidate_token()
-                continue
-            _raise_for_status(r)
-            try:
-                return r.json()
-            except Exception:
-                return {"status": r.status_code, "text": r.text}
+        client = _get_client()
+        r = await client.post(
+            f"{BASE_URL}/{path.lstrip('/')}",
+            headers={"X-Auth-Token": token},
+            json=payload,
+        )
+        if r.status_code == 401 and attempt == 0:
+            await _invalidate_token()
+            continue
+        _raise_for_status(r)
+        try:
+            return r.json()
+        except Exception:
+            return {"status": r.status_code, "text": r.text}
 
 
 async def _ome_delete(path: str) -> Any:
     """DELETE on OME API. Auto-retries once on 401."""
     for attempt in range(2):
         token = await _get_token()
-        async with _make_client() as client:
-            r = await client.delete(
-                f"{BASE_URL}/{path.lstrip('/')}",
-                headers={"X-Auth-Token": token},
-            )
-            if r.status_code == 401 and attempt == 0:
-                await _invalidate_token()
-                continue
-            _raise_for_status(r)
-            return {"status": r.status_code}
+        client = _get_client()
+        r = await client.delete(
+            f"{BASE_URL}/{path.lstrip('/')}",
+            headers={"X-Auth-Token": token},
+        )
+        if r.status_code == 401 and attempt == 0:
+            await _invalidate_token()
+            continue
+        _raise_for_status(r)
+        return {"status": r.status_code}
 
 
 def _raise_for_status(r: httpx.Response) -> None:
@@ -338,10 +342,11 @@ async def lifespan(server):
             logger.error("Could not establish initial OME session: %s", exc)
     yield
     await _logout()
+    await _close_client()
 
 
 # ── MCP Server ────────────────────────────────────────────────────────────────
-mcp = FastMCP("ome_mcp_v5", lifespan=lifespan)
+mcp = FastMCP("OME (OpenManage Enterprise) MCP Server", lifespan=lifespan)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1135,55 +1140,19 @@ async def ome_refresh_device_inventory(params: DeviceIdInput) -> str:
     except Exception as exc:
         return _handle(exc)
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    return JSONResponse({"status": "ok"})
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import uvicorn
-    logger.info(
-        "Starting OME MCP v5 server — OME_IP=%s SSL_VERIFY=%s → http://%s:%s",
-        OME_IP, OME_VERIFY_SSL, MCP_HOST, MCP_PORT,
-    )
-    from contextlib import asynccontextmanager
-    from starlette.applications import Starlette
-    from starlette.responses import JSONResponse
-    from starlette.routing import Route, Mount
-
-    async def health(request):
-        return JSONResponse({"status": "ok", "service": "ome_mcp_v5"})
-
-    # Get the FastMCP ASGI app; it is a Starlette app whose lifespan
-    # initialises the StreamableHTTP task group.  Mounting it inside a
-    # second Starlette app suppresses that lifespan, causing the
-    # "Task group is not initialized" RuntimeError.
-    # Fix: explicitly forward the inner lifespan to the outer app, and
-    # rewrite the Host header (in the ASGI scope) so FastMCP's
-    # transport-security check never sees the external client IP.
-    _patch_transport_security()
-    inner_app = mcp.streamable_http_app()
-
-    @asynccontextmanager
-    async def _lifespan(app):
-        async with inner_app.router.lifespan_context(app):
-            yield
-
-    class _HostRewrite:
-        """Rewrite Host header to 'localhost' before FastMCP security sees it."""
-        def __init__(self, wrapped):
-            self._wrapped = wrapped
-        async def __call__(self, scope, receive, send):
-            if scope.get("type") in ("http", "websocket"):
-                scope["headers"] = [
-                    (b"host", b"localhost") if k.lower() == b"host" else (k, v)
-                    for k, v in scope["headers"]
-                ]
-            await self._wrapped(scope, receive, send)
-
-    app = Starlette(
-        lifespan=_lifespan,
-        routes=[
-            Route("/health", health),
-            Mount("/", _HostRewrite(inner_app)),
-        ],
-    )
-
-    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="info")
+    # Choose transport mode from environment: "http" (default) or "stdio".
+    TRANSPORT_MODE = os.getenv("MCP_TRANSPORT_MODE", "http").lower()
+    OME_MCP_PORT = int(os.getenv("OME_MCP_PORT", "8080"))
+    logger.info("starting MCP with TRANSPORT_MODE=%s", TRANSPORT_MODE)
+    if TRANSPORT_MODE == "stdio":
+        # Run over stdio (useful for running as a direct process)
+        mcp.run(transport="stdio")
+    else:
+        # Default: run over HTTP so the container keeps running and listens on port 8080.
+        mcp.run(transport="http", host="0.0.0.0", port=OME_MCP_PORT)

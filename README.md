@@ -1,6 +1,4 @@
-# OME MCP v5 — Dell OpenManage Enterprise MCP Server
-
-**Version 5.2** | [Changelog](#changelog)
+# OME MCP — Dell OpenManage Enterprise MCP Server
 
 A Model Context Protocol (MCP) server that exposes Dell OpenManage Enterprise (OME)
 management capabilities to AI agents via a Streaming HTTP transport. No direct iDRAC
@@ -82,28 +80,32 @@ No connections are made directly to iDRAC — OME handles that internally.
 
 ### 1. Clone / copy project files
 
-```bash
-mkdir -p /opt/ome_mcp_v5
-cd /opt/ome_mcp_v5
-# Place all project files here
-```
-
 ### 2. Configure credentials
 
 ```bash
+cd ome-mcp
 cp .env.example .env
 nano .env          # Set OME_USER, OME_PASSWORD
 ```
 
 Never commit `.env` to version control.
 
-### 3. Build the image
+### 3. Start container
+```bash
+docker compose up -d
+```
+
+The MCP endpoint will be available at `http://<host>:8000/mcp`.
+
+## Service Based Install 
+
+### Build the image
 
 ```bash
 ./service_control.sh build
 ```
 
-### 4. Start the server
+### Start the server
 
 ```bash
 ./service_control.sh start
@@ -111,28 +113,14 @@ Never commit `.env` to version control.
 
 The MCP endpoint will be available at `http://<host>:8000/mcp`.
 
-### 5. Check status
+### Check status
 
 ```bash
 ./service_control.sh status
 ./service_control.sh logs 50
 ```
 
----
-
-## TLS / SSL Toggle
-
-| Scenario | Setting in `.env` |
-|----------|-------------------|
-| Lab / self-signed cert | `OME_VERIFY_SSL=false` |
-| Production (trusted CA) | `OME_VERIFY_SSL=true` |
-| Production (custom CA bundle) | `OME_VERIFY_SSL=/path/to/ca-bundle.crt` |
-
-No rebuild is required — just change the env var and restart.
-
----
-
-## Auto-start with systemd (optional)
+### Auto-start with systemd (optional)
 
 ```bash
 # Install systemd unit (auto-updates WorkingDirectory to current path)
@@ -150,6 +138,18 @@ To remove the systemd unit:
 ```bash
 sudo ./service_control.sh uninstall-systemd
 ```
+
+---
+
+## TLS / SSL Toggle
+
+| Scenario | Setting in `.env` |
+|----------|-------------------|
+| Lab / self-signed cert | `OME_VERIFY_SSL=false` |
+| Production (trusted CA) | `OME_VERIFY_SSL=true` |
+| Production (custom CA bundle) | `OME_VERIFY_SSL=/path/to/ca-bundle.crt` |
+
+No rebuild is required — just change the env var and restart.
 
 ---
 
@@ -239,7 +239,7 @@ Pass standard OData `$filter` expressions via the `filter` parameter:
 
 ## Adding New Tools
 
-1. Add a Pydantic `Input` model in `ome_mcp_v5_server.py`
+1. Add a Pydantic `Input` model in `ome_mcp_server.py`
 2. Add a function decorated with `@mcp.tool(name="ome_your_tool")`
 3. Call `_ome_get` / `_ome_post` as appropriate
 4. Rebuild: `./service_control.sh rebuild && ./service_control.sh restart`
@@ -252,33 +252,3 @@ MIT License — see LICENSE file.
 
 ---
 
-## Changelog
-
-### v5.2.0 — 2026-04-09
-
-**Fixed: `ome_remediate_firmware_baseline` completely rewritten**
-
-The tool was non-functional in v5.0/v5.1 due to three root-cause bugs:
-
-1. **Wrong endpoint** — Code used `UpdateService/Actions/UpdateService.UpdateFirmware`, which does not exist in OME 4.6+ (`UpdateService.Actions` is null). Fixed: now POSTs directly to `JobService/Jobs`.
-
-2. **Wrong Targets structure** — Old payload used `{"Id": id, "Type": {...}}`, missing the required `Data` field. Fixed: `{"Id": id, "Data": "<component_sources>", "TargetType": {"Id": 1000, "Name": "DEVICE"}}` where `Data` is a semicolon-joined string of component `SourceName` values for non-compliant components.
-
-3. **Incomplete Params** — Old params list was missing required keys. Fixed: full validated param set is `repositoryId`, `catalogId`, `complianceReportId`, `operationName`, `rebootType`, `signVerify`, `complianceUpdate`, `stagingValue`.
-
-**New execution flow:**
-1. `GET UpdateService/Baselines({id})` → extract `RepositoryId`, `CatalogId`
-2. `GET UpdateService/Baselines({id})/DeviceComplianceReports` → per-device, collect `SourceName` for components where `UpdateAction != UNKNOWN` and `ComplianceStatus` not in `{OK, UNKNOWN}`
-3. `POST JobService/Jobs` with `operationName=INSTALL_FIRMWARE`, `rebootType=2` (graceful) or `3` (stage-only)
-
-Returns an early error if no non-compliant components are found, preventing empty job creation.
-
-**Validated** by live test: full firmware update of a PowerEdge R6515 (13 components including BIOS, PERC RAID, HDDs, NICs, SSDs) against Dell online catalog baseline.
-
----
-
-### v5.0.0 — initial release
-
-- 28 read/write OME tools via Streaming HTTP MCP transport
-- Docker container with non-root user, systemd unit, health check
-- OData filtering and pagination on all list tools
