@@ -1,5 +1,9 @@
 ## Changelog
 
+### v6.1.1 - 2026-10-13
+
+- Added Github Action to publish container
+
 ### v6.1.0 — 2026-06-24
 
 - **Refactor:** Extract `OMEClient` into `src/ome_client.py` and move Pydantic input models into `src/models.py` to improve separation of concerns. Fixed odata filter handling by removing unnecessary html escape characters. Improved Pydantic model descriptions to help the LLM with odata filtering fields. Added an `include` argument to `_ome_get` to limit the amount of json returned.
