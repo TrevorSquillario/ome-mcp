@@ -97,48 +97,6 @@ docker compose up -d
 
 The MCP endpoint will be available at `http://<host>:8000/mcp`.
 
-## Service Based Install 
-
-### Build the image
-
-```bash
-./service_control.sh build
-```
-
-### Start the server
-
-```bash
-./service_control.sh start
-```
-
-The MCP endpoint will be available at `http://<host>:8000/mcp`.
-
-### Check status
-
-```bash
-./service_control.sh status
-./service_control.sh logs 50
-```
-
-### Auto-start with systemd (optional)
-
-```bash
-# Install systemd unit (auto-updates WorkingDirectory to current path)
-sudo ./service_control.sh install-systemd
-
-# Start now
-sudo systemctl start ome_mcp_v5
-
-# View logs
-sudo journalctl -u ome_mcp_v5 -f
-```
-
-To remove the systemd unit:
-
-```bash
-sudo ./service_control.sh uninstall-systemd
-```
-
 ---
 
 ## TLS / SSL Toggle
@@ -218,11 +176,6 @@ Pass standard OData `$filter` expressions via the `filter` parameter:
 
 ## Troubleshooting
 
-**Container won't start:**
-```bash
-./service_control.sh logs
-```
-
 **Authentication errors:**
 - Verify `OME_USER` / `OME_PASSWORD` in `.env`
 - Confirm OME is reachable: `curl -k https://192.168.1.145/api/SessionService/Sessions`
@@ -234,21 +187,3 @@ Pass standard OData `$filter` expressions via the `filter` parameter:
 **Tools return empty results:**
 - Devices may not be discovered yet — use `ome_create_discovery_job`
 - Check OME permissions for the API account
-
----
-
-## Adding New Tools
-
-1. Add a Pydantic `Input` model in `ome_mcp_server.py`
-2. Add a function decorated with `@mcp.tool(name="ome_your_tool")`
-3. Call `_ome_get` / `_ome_post` as appropriate
-4. Rebuild: `./service_control.sh rebuild && ./service_control.sh restart`
-
----
-
-## License
-
-MIT License — see LICENSE file.
-
----
-
