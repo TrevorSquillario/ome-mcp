@@ -1,7 +1,6 @@
 
 services:
   ome_mcp:
-    image: ome_mcp:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -22,8 +21,8 @@ services:
       OME_VERIFY_SSL: "${OME_VERIFY_SSL:-false}"
       # runtime environment mode (dev|prod)
       OME_APP_ENV: "${OME_APP_ENV:-dev}"
-    volumes:
-      - ./src:/app/src
+    #volumes:
+    #  - ./src:/app/src
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s
